@@ -1,0 +1,97 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Among Us RL Training Config
+# Load with:  python training/train.py --config training/train_config.yml
+#
+# Multi-GPU (DDP):
+#   torchrun --nproc_per_node=4 training/train.py --config training/train_config.yml
+#
+# All values here override the dataclass defaults in TrainConfig.
+# Any key can be omitted to keep the default.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Model ──────────────────────────────────────────────────────────────────
+model_path: "/data/kmirakho/verl/models/Qwen3-4B-Instruct-2507"
+
+# Comma-separated GPU indices to use.
+# Single GPU:             cuda_devices: "0"
+# Multiple specific GPUs: cuda_devices: "0,1,3"
+# Under torchrun, CUDA_VISIBLE_DEVICES is set from this and nproc_per_node
+# is inferred automatically from the number of listed devices.
+cuda_devices: "2,7"
+
+# ── LoRA ───────────────────────────────────────────────────────────────────
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# Modules to apply LoRA to (null = PEFT default for Qwen)
+lora_target_modules: null        # e.g. ["q_proj", "v_proj"]
+
+# ── Warmup ─────────────────────────────────────────────────────────────────
+warmup_games: 20                 # synthetic data scale factor
+warmup_belief_epochs: 5
+warmup_critic_epochs: 5
+warmup_belief_lr: 1.0e-4
+warmup_critic_lr: 1.0e-4
+warmup_batch_size: 64
+warmup_synthetic_scale: 200      # total samples = warmup_games × scale
+
+# ── PPO ────────────────────────────────────────────────────────────────────
+num_iterations: 100
+games_per_iter: 5
+ppo_epochs: 4
+ppo_lr_policy: 1.0e-5
+ppo_lr_heads: 3.0e-4
+clip_eps: 0.2
+gamma: 0.99
+gae_lambda: 0.95
+entropy_coef: 0.01
+value_loss_coef: 0.5
+belief_loss_coef: 0.3
+max_grad_norm: 0.5
+target_kl: 0.02
+mini_batch_size: 16              # per-GPU batch size for PPO mini-batches
+
+# ── Game ───────────────────────────────────────────────────────────────────
+game_config_name: "FIVE_MEMBER_GAME"   # FIVE_MEMBER_GAME | SEVEN_MEMBER_GAME
+vllm_port: 8234
+max_players: 9
+belief_dim: 9
+
+# ── Multi-GPU ──────────────────────────────────────────────────────────────
+# Set cuda_devices (above, under Model) to a comma-separated list, e.g.:
+#   cuda_devices: "0,1,3"   ← 3 GPUs: indices 0, 1, and 3
+#
+# Then launch with (nproc_per_node must match the number of listed devices):
+#   torchrun --nproc_per_node=3 training/train.py --config training/train_config.yml
+#
+# train.py will set CUDA_VISIBLE_DEVICES="0,1,3" automatically. Each rank
+# maps to LOCAL_RANK 0→GPU0, 1→GPU1, 2→GPU3 via the visible-device remapping.
+#
+# Alternatively just run:  python training/train.py --config training/train_config.yml
+# and train.py will re-exec itself under torchrun when it sees >1 cuda_devices.
+ddp_backend: "nccl"              # nccl (GPU) | gloo (CPU / debug)
+games_parallel: 1                # game-collection parallelism per rank
+
+# ── Checkpointing ──────────────────────────────────────────────────────────
+checkpoint_dir: "./checkpoints"
+crewmate_checkpoint_dir: "./checkpoints/crewmate"   # LoRA adapter for Crewmate role
+impostor_checkpoint_dir: "./checkpoints/impostor"   # LoRA adapter for Impostor role
+checkpoint_every: 10             # save every N PPO iterations
+log_dir: "./logs"
+
+# ── Alternating Training ───────────────────────────────────────────────────
+# Train Crewmate LoRA for N iters, then Impostor LoRA for N iters, repeat.
+# Games are always played with both roles; only the active role's adapter is updated.
+alternate_every: 5               # iterations per role phase
+
+# ── Weights & Biases ───────────────────────────────────────────────────────
+wandb_enabled: true
+wandb_project: "among-us-rl"
+wandb_entity: "km1369"         # your W&B username or team slug
+wandb_run_name: null           # null = auto-generated name
+wandb_tags: []                 # e.g. ["ppo", "lora", "5-player"]
+wandb_watch_models: false      # set true to log gradients (slow)
+
+# ── Misc ───────────────────────────────────────────────────────────────────
+seed: 42

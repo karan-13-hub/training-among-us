@@ -94,6 +94,10 @@ class ActorModule:
       3. Witness FAKE_TASK       → ×1.10        (Weak Suspicion)
       4. Witness VISUAL_TASK     → ×0.90        (Soft Clear)
       5. Witness COMPLETE_TASK   → ×0.90        (Trust Building)
+
+    A trained ``BeliefModel`` can be injected via :meth:`set_belief_model`.
+    When set, the neural model is used for belief updates; otherwise the
+    hard-coded rules above remain active (backward compatible).
     """
 
     def __init__(self, player, all_players):
@@ -110,6 +114,39 @@ class ActorModule:
         self.second_order_beliefs = {
             p.name: initial_val for p in all_players if p.name != player.name
         }
+
+        # Ordered list of other-player names (needed for tensor conversion)
+        self._all_player_names = [p.name for p in all_players if p.name != player.name]
+
+        # Optional trained belief model (injected at RL training time)
+        self._belief_model  = None   # training.belief_model.BeliefModel
+        self._belief_device = None
+
+        # Cached hidden-state pool from the last LoRA forward pass.
+        # Set by the RolloutCollector (or any inference wrapper) after each
+        # LLM call so that update_beliefs() can feed it into the BeliefModel.
+        self._last_hidden_pool = None  # Optional[torch.Tensor] shape [hidden_size]
+
+    def set_belief_model(self, belief_model, device="cuda"):
+        """
+        Inject a trained :class:`training.belief_model.BeliefModel`.
+
+        Once set, :meth:`update_beliefs` will use the neural network output
+        to **replace** the rule-computed suspicion / second-order belief
+        values so that :meth:`format_belief_for_prompt` shows model beliefs.
+
+        Rules still run first so that hard-evidence events (KILL/VENT) are
+        always reflected; the model then refines the full distribution.
+
+        Parameters
+        ----------
+        belief_model : BeliefModel
+        device : str
+            Device where the model lives ("cuda" / "cpu").
+        """
+        import torch
+        self._belief_model  = belief_model.eval()
+        self._belief_device = torch.device(device)
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -131,16 +168,25 @@ class ActorModule:
                 "witnesses": ["Player 1: blue", ...]  # who saw it
             }
 
-        Rules:
+        **Phase 1 — Hard Rules** (always run):
           1. KILL / VENT       → 1.0  (Hard Evidence)
           2. SABOTAGE          → ×1.25
           3. FAKE_TASK         → ×1.10
           4. VISUAL_TASK       → ×0.90 (Soft Clear)
           5. COMPLETE_TASK     → ×0.90
+
+        **Phase 2 — BeliefModel override** (when a trained model is set):
+        The model's predicted belief vector replaces the rule-computed values
+        so that :meth:`format_belief_for_prompt` always shows model beliefs.
+        Hard-evidence events (KILL/VENT = 1.0) are re-applied as a floor
+        so the model cannot suppress a directly-witnessed kill.
         """
+        # ── Phase 1: deterministic rules ───────────────────────────────
+        _hard_evidence: dict = {}   # track direct witnesses (floor for model)
+
         for event in observation_log:
-            subject = event["subject"]
-            action = event["action"]
+            subject  = event["subject"]
+            action   = event["action"]
             witnesses = event.get("witnesses", [])
 
             if subject == self.player.name:
@@ -152,6 +198,7 @@ class ActorModule:
 
                 if action in ("KILL", "VENT"):
                     new = 1.0
+                    _hard_evidence[subject] = 1.0
                 elif action == "SABOTAGE":
                     new = cur * 1.25
                 elif action == "FAKE_TASK":
@@ -169,11 +216,11 @@ class ActorModule:
             elif self.player.role == "Impostor":
                 cur = self.second_order_beliefs.get(subject, 0.5)
 
-                # Did *subject* witness ME doing something incriminating?
                 if (event["subject"] == self.player.name
                         and subject in witnesses):
                     if action in ("KILL", "VENT"):
                         new = 1.0
+                        _hard_evidence[subject] = 1.0
                     elif action == "SABOTAGE":
                         new = cur * 1.25
                     elif action == "FAKE_TASK":
@@ -181,9 +228,96 @@ class ActorModule:
                     else:
                         new = cur
                 else:
-                    new = cur  # no new info → keep current estimate
+                    new = cur
 
                 self.second_order_beliefs[subject] = self._clamp(new)
+
+        # ── Phase 2: BeliefModel override ──────────────────────────────
+        # If a trained model is attached and we have a cached hidden pool,
+        # run the forward pass and OVERWRITE the belief dicts so the prompt
+        # shows model beliefs instead of (or in addition to) rule beliefs.
+        if self._belief_model is not None and self._last_hidden_pool is not None:
+            self._apply_belief_model(_hard_evidence)
+
+    def _apply_belief_model(self, hard_evidence: Optional[Dict[str, float]] = None):
+        """
+        Run the BeliefModel forward pass using ``_last_hidden_pool`` and
+        **overwrite** ``suspicion_matrix`` / ``second_order_beliefs`` with the
+        model’s predicted values.
+
+        Hard-evidence floors (KILL/VENT = 1.0) are re-applied after the model
+        output so the model cannot suppress directly-witnessed crimes.
+
+        Parameters
+        ----------
+        hard_evidence : dict or None
+            Mapping of player-name → floor value (1.0) for directly-witnessed
+            kill/vent events that must remain at 1.0 regardless of model output.
+        """
+        import torch
+        from training.belief_model import beliefs_to_tensor
+
+        if self._belief_model is None or self._last_hidden_pool is None:
+            return
+
+        hard_evidence = hard_evidence or {}
+        is_impostor = self.player.role in ("Impostor", "Imposter")
+        beliefs = self.second_order_beliefs if is_impostor else self.suspicion_matrix
+
+        B   = len(self._all_player_names)
+        D   = self._belief_model.config.belief_dim
+
+        # Current belief vector (model’s prior)
+        bvec = beliefs_to_tensor(beliefs, self._all_player_names, D)\
+                   .unsqueeze(0).to(self._belief_device)   # [1, D]
+
+        # Role embedding (0 = Crewmate, 1 = Impostor)
+        role_id = torch.tensor(
+            [1 if is_impostor else 0],
+            dtype=torch.long, device=self._belief_device
+        )
+
+        # Hidden pool — ensure float32 on correct device
+        hp = self._last_hidden_pool.float().to(self._belief_device)
+        if hp.dim() == 1:
+            hp = hp.unsqueeze(0)   # [1, H]
+
+        with torch.no_grad():
+            pred = self._belief_model(hp, bvec, role_id)   # [1, D]
+        pred = pred.squeeze(0).cpu()  # [D]
+
+        # Map model output back to the belief dict
+        for i, name in enumerate(self._all_player_names):
+            if i >= D:
+                break
+            score = float(self._clamp(pred[i].item()))
+            # Re-apply hard-evidence floor
+            score = max(score, hard_evidence.get(name, 0.0))
+            if is_impostor:
+                self.second_order_beliefs[name] = score
+            else:
+                self.suspicion_matrix[name] = score
+
+    def update_beliefs_from_model(self, hidden_pool):
+        """
+        Explicitly update beliefs using the BeliefModel with a freshly-computed
+        ``hidden_pool``.
+
+        This is the primary API used by the :class:`RolloutCollector` (or any
+        RL inference wrapper) after each LLM forward pass where the hidden states
+        are available.  Calling this stores the hidden pool and immediately runs
+        :meth:`_apply_belief_model`.
+
+        Parameters
+        ----------
+        hidden_pool : torch.Tensor
+            Pooled hidden states from the policy backbone, shape [hidden_size]
+            or [1, hidden_size].
+        """
+        self._last_hidden_pool = hidden_pool
+        if self._belief_model is not None:
+            self._apply_belief_model()
+
 
     # ── LLM-based action generation ──────────────────────────────────
 
@@ -233,6 +367,128 @@ class ActorModule:
         else:
             result["second_order_beliefs"] = self.second_order_beliefs
         return result
+
+    # ── Belief → Prompt Formatter ─────────────────────────────────────────
+
+    def format_belief_for_prompt(
+        self,
+        top_k: int = 3,
+        threshold_high: float = 0.70,
+        threshold_low: float = 0.30,
+    ) -> str:
+        """
+        Render the current belief state as a concise advisory block for
+        inclusion in LLM action-selection and speech prompts.
+
+        For **Crewmates** this exposes the first-order suspicion matrix so
+        the agent can:
+          - speak strategically (accuse high-suspicion players, vouch for low)
+          - choose actions that prioritise self-preservation (avoid being alone
+            with high-suspicion players)
+
+        For **Impostors** this exposes the second-order threat model so the
+        agent can:
+          - prioritise killing witnesses before they call a meeting
+          - frame low-threat players as they are trusted by the group
+
+        Parameters
+        ----------
+        top_k : int
+            Maximum number of players to list in each category.
+        threshold_high : float
+            Belief score above which a player is flagged as HIGH suspicion /
+            HIGH threat.
+        threshold_low : float
+            Belief score below which a player is flagged as SAFE / TRUSTED.
+
+        Returns
+        -------
+        str  — a formatted block ready to splice into a prompt, or "" if the
+               belief dict is empty.
+        """
+        role = getattr(self.player, "identity",
+                       getattr(self.player, "role", "Crewmate"))
+        is_impostor = role.lower() in ("impostor", "imposter")
+
+        if is_impostor:
+            beliefs = self.second_order_beliefs
+        else:
+            beliefs = self.suspicion_matrix
+
+        if not beliefs:
+            return ""
+
+        # Sort by score descending
+        ranked = sorted(beliefs.items(), key=lambda kv: kv[1], reverse=True)
+
+        high = [(n, s) for n, s in ranked if s >= threshold_high][:top_k]
+        mid  = [(n, s) for n, s in ranked
+                if threshold_low <= s < threshold_high][:top_k]
+        low  = [(n, s) for n, s in ranked if s < threshold_low][:top_k]
+
+        lines = []
+
+        if is_impostor:
+            lines.append("## 🧠 SECOND-ORDER BELIEF (who suspects YOU?)")
+            lines.append(
+                "These are YOUR internal threat estimates. "
+                "Higher = that player suspects you more. "
+                "Use this to decide kill priority and speech strategy."
+            )
+
+            if high:
+                lines.append("\n**⚠️ HIGH THREAT — may expose you (prioritise eliminating or silencing):**")
+                for name, score in high:
+                    lines.append(f"  • {name}: {score:.2f} — they may accuse you next meeting")
+
+            if mid:
+                lines.append("\n**😐 MODERATE THREAT — uncertain, stay vague around them:**")
+                for name, score in mid:
+                    lines.append(f"  • {name}: {score:.2f}")
+
+            if low:
+                lines.append("\n**✅ LOW THREAT — trust you (safe to keep alive as alibi cover):**")
+                for name, score in low:
+                    lines.append(f"  • {name}: {score:.2f} — a good frame target or useful shield")
+
+            lines.append(
+                "\n**STRATEGY HINT:**"
+                "\n  • In DISCUSSION: deflect accusations away from yourself toward neutral/medium players."
+                "\n  • On KILL decisions: HIGH THREAT players are your biggest risk — eliminate before next meeting."
+                "\n  • LOW THREAT players can be framed — mention you 'saw them acting suspicious'."
+            )
+
+        else:  # Crewmate
+            lines.append("## 🧠 SUSPICION MATRIX (your internal read on other players)")
+            lines.append(
+                "These are YOUR belief estimates — not shared publicly. "
+                "Higher = you believe that player is the Impostor. "
+                "Use this to decide who to accuse, who to trust, and where to go."
+            )
+
+            if high:
+                lines.append("\n**🔴 HIGH SUSPICION — strong impostor signal:**")
+                for name, score in high:
+                    lines.append(f"  • {name}: {score:.2f} — avoid being alone with them; accuse in meetings")
+
+            if mid:
+                lines.append("\n**🟡 MEDIUM SUSPICION — needs more observation:**")
+                for name, score in mid:
+                    lines.append(f"  • {name}: {score:.2f} — watch carefully; don't fully trust")
+
+            if low:
+                lines.append("\n**🟢 LOW SUSPICION — likely safe:**")
+                for name, score in low:
+                    lines.append(f"  • {name}: {score:.2f} — can move/work near them without extra risk")
+
+            lines.append(
+                "\n**STRATEGY HINT:**"
+                "\n  • In DISCUSSION: name your top suspect and cite WHY (what you observed)."
+                "\n  • When MOVING: prefer rooms with LOW suspicion players; avoid HIGH suspicion ones when alone."
+                "\n  • In VOTING: weight your vote toward your highest-suspicion player IF you have evidence."
+            )
+
+        return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

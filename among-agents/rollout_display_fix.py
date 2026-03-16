@@ -12,7 +12,8 @@ CELL 1: RL Analysis (replaces the analysis cell that builds `df`)
 
 # ── RL Analysis (FIXED: uses embedded state snapshots) ────────
 from amongagents.agent.actor import ActorModule
-from amongagents.agent.rewards import RewardEngine, CriticModule
+from amongagents.agent.rewards import RewardEngine
+from amongagents.agent.critic import CriticModule
 from collections import defaultdict
 import pandas as pd
 

@@ -7,6 +7,7 @@ import json
 import os
 
 from amongagents.agent.agent import HumanAgent, LLMAgent, LLMHumanAgent, RandomAgent
+from amongagents.agent.actor import ActorModule
 from amongagents.agent.neutral_prompts import (
     TASK_PHASE_INSTRUCTION,
     CrewmatePersonalities,
@@ -210,6 +211,14 @@ class AmongUs:
                     "personality": player.personality,
                     "tasks": [task.name for task in player.tasks],
                 }
+
+            # ── Attach an ActorModule to every LLMAgent ─────────────────────
+            # After ALL agents are created we know the full player list,
+            # so we can pass it to each ActorModule constructor.
+            for agent in self.agents:
+                if isinstance(agent, LLMAgent):
+                    actor_mod = ActorModule(agent.player, self.players)
+                    agent.set_actor_module(actor_mod)
 
     def report_winner(self, winner):
         winner_reason_map = {
@@ -466,6 +475,48 @@ class AmongUs:
             self.meeting_caller = agent
             
         agent.player.make_action(self, action, observation_location)
+
+        # ── BELIEF UPDATE: push executed action to every agent's ActorModule ───
+        # Build a structured event from the action that just ran so that all
+        # living agents can update their suspicion / second-order beliefs.
+        # Only observation-relevant actions (KILL, VENT, SABOTAGE, FAKE_TASK,
+        # VISUAL_TASK, COMPLETE_TASK) are broadcast; movement is noise.
+        _BELIEF_ACTION_MAP = {
+            "KILL":               "KILL",
+            "VENT":               "VENT",
+            "SABOTAGE":           "SABOTAGE",
+            "COMPLETE FAKE TASK": "FAKE_TASK",
+            "COMPLETE TASK":      "COMPLETE_TASK",
+            "FIX SABOTAGE":       "COMPLETE_TASK",
+        }
+        belief_action = _BELIEF_ACTION_MAP.get(action.name)
+        if belief_action is not None:
+            # Who could have witnessed this action (same room as actor)?
+            actor_location = agent.player.location
+            witnesses = [
+                p.name for p in self.players
+                if p.is_alive and p.name != agent.player.name
+                and p.location == actor_location
+            ]
+            # VISUAL_TASK: only complete-task actions that show an animation
+            # (conservatively treat all COMPLETE_TASK as VISUAL_TASK so that
+            # witnesses soften their suspicion of that player).
+            event = {
+                "subject":   agent.player.name,
+                "action":    belief_action,
+                "witnesses": witnesses,
+            }
+            for other_agent in self.agents:
+                if (
+                    isinstance(other_agent, LLMAgent)
+                    and other_agent.actor_module is not None
+                    and other_agent.player.is_alive
+                    and other_agent.player.name != agent.player.name
+                ):
+                    try:
+                        other_agent.actor_module.update_beliefs([event])
+                    except Exception as _bupd_err:
+                        pass  # never let belief updates crash the game
         
         # ═══ PHANTOM ALIBI ENGINE: Update Impostor's fake memory track ═══
         # After each action, record what the Impostor "claims" to have done.

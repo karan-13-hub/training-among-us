@@ -67,18 +67,41 @@ class CriticModule:
 
     Produces V(s, team) ∈ [0.0, 1.0] — the estimated probability that
     *team* wins from the current game state.
+
+    A trained :class:`training.critic_model.CriticModel` can be injected via
+    :meth:`set_critic_model`. When set, the neural network is used for V(s);
+    otherwise the deterministic heuristic remains active (backward compatible).
     """
 
     def __init__(self):
-        # Placeholder for LLM client or learned model weights
-        pass
+        # Optional trained critic model (injected at RL training time)
+        self._critic_model  = None   # training.critic_model.CriticModel
+        self._critic_device = None
 
-    # ── public API ───────────────────────────────────────────────────
+    def set_critic_model(self, critic_model, device="cuda"):
+        """
+        Inject a trained :class:`training.critic_model.CriticModel`.
+
+        Once set, :meth:`evaluate_state_value` will use the neural network
+        instead of the deterministic heuristic.
+
+        Parameters
+        ----------
+        critic_model : CriticModel
+        device : str
+            Device where the model lives ("cuda" / "cpu").
+        """
+        import torch
+        self._critic_model  = critic_model.eval()
+        self._critic_device = torch.device(device)
+
+    # ── public API ─────────────────────────────────────────────
 
     def evaluate_state_value(
         self,
         game_state: Dict[str, Any],
         team_perspective: str,
+        hidden_pool=None,   # Optional[torch.Tensor] — [1, hidden_size]
     ) -> float:
         """Predict the win probability for *team_perspective*.
 
@@ -91,12 +114,30 @@ class CriticModule:
               ``ejected_roles`` (list of role strings).
         team_perspective : str
             ``"Crewmate"`` or ``"Impostor"``.
+        hidden_pool : torch.Tensor or None
+            If a trained CriticModel has been injected, pass the backbone
+            hidden-state pool (from LoRAQwenPolicy.get_log_probs_and_hidden)
+            to enable neural value estimation. Ignored otherwise.
 
         Returns
         -------
         float
             Value in [0.0, 1.0].
         """
+        # ── Trained neural critic ────────────────────────────────────
+        if self._critic_model is not None and hidden_pool is not None:
+            import torch
+            from training.critic_model import extract_game_features
+            is_imp  = (team_perspective == "Impostor")
+            gf      = extract_game_features(game_state, is_imp).to(self._critic_device)
+            hp      = hidden_pool.to(self._critic_device)
+            if hp.dim() == 1:
+                hp = hp.unsqueeze(0)
+            with torch.no_grad():
+                val = self._critic_model(hp, gf.unsqueeze(0)).item()
+            return float(val)
+
+        # ── Heuristic fallback (original behaviour) ──────────────────
         prompt = self._construct_prompt(game_state, team_perspective)
         raw = self._call_llm(prompt)
         return self._parse_value(raw)

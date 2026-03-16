@@ -77,6 +77,27 @@ class LLMAgent(Agent):
         self.compact_log_path = os.getenv("EXPERIMENT_PATH") + "/agent-logs-compact.json"
         self.game_index = game_index
 
+        # Optional ActorModule — when set, its belief output is injected into
+        # every action-selection and speech prompt so the LLM conditions its
+        # decisions on the current suspicion / second-order belief state.
+        self.actor_module = None  # ActorModule
+
+    def set_actor_module(self, actor_module):
+        """
+        Attach a (possibly trained) ActorModule to this agent.
+
+        Once set, ``actor_module.format_belief_for_prompt()`` is called
+        before every LLM step and the result is appended to the user
+        message in :meth:`_compose_action_prompt`.
+
+        Parameters
+        ----------
+        actor_module : ActorModule
+            The actor module whose belief state should be injected.
+        """
+        self.actor_module = actor_module
+
+
     def log_interaction(self, sysprompt, prompt, original_response, step):
         """
         Helper method to store model interactions in properly nested JSON format.
@@ -1657,6 +1678,23 @@ Do NOT generate safety checks, suspicion analysis, or observation logic. You are
         # adherence to the structured JSON.
         # ═══════════════════════════════════════════════════════════════
 
+        # ─── BELIEF BLOCK (from ActorModule) ───────────────────────────────
+        # When an ActorModule is attached, its current belief state is rendered
+        # as a terse advisory and injected into EVERY LLM prompt phase:
+        #   • Task phase   → guides movement & kill decisions
+        #   • Discussion   → guides who to accuse / vouch for
+        #   • Voting       → guides vote targeting
+        # This is intentionally placed late in prompt construction so it has
+        # recency-bias priority (LLMs weight recent tokens more heavily).
+        belief_block = ""
+        if self.actor_module is not None:
+            try:
+                raw_belief = self.actor_module.format_belief_for_prompt()
+                if raw_belief:
+                    belief_block = f"\n\n{raw_belief}\n"
+            except Exception as _belief_err:
+                print(f"[WARNING] belief format failed for {self.player.name}: {_belief_err}")
+
         # --- Message 2: State Injection (user) ---
         state_injection = (
             f"{identity_reminder}"
@@ -1702,6 +1740,22 @@ Do NOT generate safety checks, suspicion analysis, or observation logic. You are
                 if isinstance(fake_alibi, list) and fake_alibi:
                     ack_parts.append(f"My cover story: {fake_alibi[-1]}.")
 
+        # Belief state acknowledgment (always, if actor_module present)
+        if belief_block and self.actor_module is not None:
+            is_impostor_role = self.player.identity == "Impostor"
+            top_belief = max(
+                self.actor_module.second_order_beliefs.items() if is_impostor_role
+                else self.actor_module.suspicion_matrix.items(),
+                key=lambda kv: kv[1],
+                default=(None, 0.0),
+            )
+            if top_belief[0] is not None:
+                label = "highest threat" if is_impostor_role else "most suspected"
+                ack_parts.append(
+                    f"Belief state: {label} is {top_belief[0]} "
+                    f"(score={top_belief[1]:.2f})."
+                )
+
         fake_ack = " ".join(ack_parts)
 
         # --- Message 4: Action Request (user) ---
@@ -1732,6 +1786,7 @@ Do NOT generate safety checks, suspicion analysis, or observation logic. You are
             f"{contradiction_block}"
             f"{phantom_block}"
             f"{third_impostor_block}"
+            f"{belief_block}"
             f"{format_reminder}"
         )
 
